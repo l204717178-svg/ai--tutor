@@ -1,3 +1,9 @@
+V1.1 已迭代功能：
+取消study plan 
+增加翻译模式：可随时暂停继续翻译进程；
+快捷提问：选取原文件一段内容，可直接进行提问
+自动翻译功能：为了节省token仅翻译当前显示叶敏啊及其下一页，当翻阅到后面页面再同步进行翻译
+历史记录优化：可删除和修改历史记录，study mode需要进行提问后才会记入历史记录
 # React + Vite
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
