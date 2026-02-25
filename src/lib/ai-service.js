@@ -1,4 +1,5 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import useFileStore from "../store/useFileStore";
 
 const API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
 const baseUrl = "http://127.0.0.1:8045";
@@ -38,6 +39,12 @@ async function callAI(payload, modelOverride = MODEL_NAME) {
     try {
         const data = JSON.parse(responseText);
         if (data.error) throw new Error(data.error.message);
+
+        // Track Token Usage
+        if (data.usageMetadata && data.usageMetadata.totalTokenCount) {
+            useFileStore.getState().addTokensUsed(data.usageMetadata.totalTokenCount);
+        }
+
         return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
     } catch (e) {
         throw new Error(`Parse Error: ${e.message}`);
@@ -97,6 +104,45 @@ export const generateStudyPlan = async (pdfText) => {
     }
 };
 
+export const translateToChinese = async (text, options = {}) => {
+    if (!text || !text.trim()) return "";
+
+    const chunks = splitTextIntoChunks(text, 1500);
+    const outputs = [];
+
+    for (const chunk of chunks) {
+        if (options.isCancelled && options.isCancelled()) {
+            throw new Error('Translation cancelled')
+        }
+        if (options.waitIfPaused) {
+            await options.waitIfPaused()
+        }
+        const prompt = `
+You are a professional translator for academic slides.
+Translate the following content into Simplified Chinese.
+Requirements:
+1. Keep formulas, symbols, and variable names unchanged.
+2. Preserve list markers like "-", "•", "1.", "(a)" and keep line order.
+3. Do not reorder lines or add explanations. Return only the translated text.
+4. Keep headings short and accurate; do not append extra words.
+
+Content:
+${chunk}
+        `;
+
+        try {
+            const translatedText = await callAI({
+                contents: [{ parts: [{ text: prompt }] }]
+            });
+            outputs.push(translatedText.trim());
+        } catch (error) {
+            throw new Error(`Translate API Error: ${error.message}`);
+        }
+    }
+
+    return outputs.join('\n');
+};
+
 export const chatWithMentor = async (message, history, context) => {
     const systemPrompt = `You are a professional academic tutor. Your goal is to help students understand complex materials.
         
@@ -140,7 +186,8 @@ ${context ? context.substring(0, 30000) : "No document context."}`;
 export const analyzeAssignment = async (pdfText) => {
     if (!pdfText) throw new Error("No document text provided.");
 
-    const prompt = `
+    const expectedSubparts = extractExpectedSubparts(pdfText);
+    const prompt = (snippet) => `
 You are an expert bilingual (English and Simplified Chinese) Academic Teaching Assistant. Your primary task is to solve engineering, physics, and robotics homework problems and present the solutions in a strictly structured, step-by-step format.
 
 **Strict Formatting Rules:**
@@ -148,9 +195,7 @@ For every homework problem provided by the user, you MUST use the following exac
 
 ### 📝 Q[Number]. [English Topic] | [Chinese Topic]
 
-> **Question:** [Original English Question Text]
-> 
-> **题目：** [Chinese Translation of the Question]
+> **题目：** [Complete Chinese Translation of the Question]
 
 For each sub-question (a, b, c, etc.), follow this structure:
 
@@ -172,21 +217,101 @@ For each sub-question (a, b, c, etc.), follow this structure:
 3. Math Formatting: Use standard LaTeX formatting for all mathematical equations, variables, and units (e.g., $v=15\\ m/s$, $a_{max}=6\\ m/s^2$).
 4. Semantic Markdown: ALWAYS use the markdown headings (\`###\`, \`####\`), blockquotes (\`>\`), and bold text (\`**\`) EXACTLY as shown in the template to ensure beautiful UI rendering.
 5. Tone: Academic, precise, objective, and highly structured.
+6. Coverage: You MUST answer ALL sub-questions that appear in the assignment text. If a sub-question is missing data, still include it and state "Insufficient information from the prompt" in both languages.
+7. Order: Preserve the original order of sub-questions (a, b, c, ...).
+8. Do NOT include the original English question text anywhere. Only provide the complete Chinese translation in the question block.
 
 ---
 Here is the assignment file content to analyze and solve:
-${pdfText.substring(0, 30000)}
+${snippet}
     `;
 
     try {
-        return await callAI({
-            contents: [{ parts: [{ text: prompt }] }]
-        });
+        const primary = await callAIWithRetry((limit) => callAI({
+            contents: [{ parts: [{ text: prompt(pdfText.substring(0, limit)) }] }]
+        }));
+        const completed = await ensureAllSubpartsAnswered(primary, expectedSubparts, pdfText);
+        return completed;
     } catch (error) {
         console.error("Error analyzing assignment:", error);
         throw error;
     }
 };
+
+function extractExpectedSubparts(text) {
+    if (!text) return [];
+    const matches = text.match(/\b\(([a-g])\)|\b([a-g])\)/gi) || [];
+    const letters = new Set();
+    for (const m of matches) {
+        const letter = (m.match(/[a-g]/i) || [])[0];
+        if (letter) letters.add(letter.toLowerCase());
+    }
+    return Array.from(letters).sort();
+}
+
+function extractAnsweredSubparts(text) {
+    if (!text) return [];
+    const matches = text.match(/####\s*🔹\s*\(([a-g])\)/gi) || [];
+    const letters = new Set();
+    for (const m of matches) {
+        const letter = (m.match(/[a-g]/i) || [])[0];
+        if (letter) letters.add(letter.toLowerCase());
+    }
+    return Array.from(letters).sort();
+}
+
+async function ensureAllSubpartsAnswered(primaryText, expectedSubparts, pdfText) {
+    if (!expectedSubparts.length) return primaryText;
+    const answered = extractAnsweredSubparts(primaryText);
+    const missing = expectedSubparts.filter(l => !answered.includes(l));
+    if (missing.length === 0) return primaryText;
+
+    const followUpPrompt = (snippet) => `
+You are continuing the same assignment. The previous answer missed these sub-questions: ${missing.map(l => `(${l})`).join(", ")}.
+
+Please output ONLY the missing sub-question sections using the exact template below. Do not repeat any other sub-questions.
+
+Template:
+#### 🔹 ([Letter]) [English Sub-topic] | [Chinese Sub-topic]
+
+**English Answer:**
+[Step 1 ...]
+[Step 2 ...]
+
+**中文答案：**
+[步骤 1 ...]
+[步骤 2 ...]
+
+---
+
+Assignment content for reference:
+${snippet}
+    `;
+
+    const followUpText = await callAIWithRetry((limit) => callAI({
+        contents: [{ parts: [{ text: followUpPrompt(pdfText.substring(0, limit)) }] }]
+    }));
+
+    return `${primaryText}\n\n---\n\n${followUpText}`;
+}
+
+async function callAIWithRetry(fn, maxRetries = 2) {
+    let lastError;
+    let snippetLimit = 30000;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            return await fn(snippetLimit);
+        } catch (err) {
+            lastError = err;
+            const msg = `${err?.message || err}`;
+            const isStreamError = msg.includes("Stream collection error") || msg.includes("error decoding response body");
+            if (!isStreamError || attempt === maxRetries) break;
+            snippetLimit = Math.max(12000, Math.floor(snippetLimit * 0.6));
+            await new Promise(r => setTimeout(r, 400 * (attempt + 1)));
+        }
+    }
+    throw lastError;
+}
 
 // --- Tavily Web Search Helper ---
 async function searchWeb(query) {
@@ -219,6 +344,40 @@ async function searchWeb(query) {
         console.error("Failed to execute Web Search:", e);
         return "";
     }
+}
+
+function splitTextIntoChunks(text, maxLen) {
+    const paragraphs = text.split(/\n+/).filter(Boolean);
+    const chunks = [];
+    let current = '';
+
+    const pushCurrent = () => {
+        if (current.trim()) chunks.push(current.trim());
+        current = '';
+    };
+
+    for (const p of paragraphs) {
+        if (p.length > maxLen) {
+            pushCurrent();
+            let start = 0;
+            while (start < p.length) {
+                const slice = p.slice(start, start + maxLen);
+                chunks.push(slice.trim());
+                start += maxLen;
+            }
+            continue;
+        }
+
+        if ((current + '\n' + p).length > maxLen) {
+            pushCurrent();
+            current = p;
+        } else {
+            current = current ? `${current}\n${p}` : p;
+        }
+    }
+
+    pushCurrent();
+    return chunks.length ? chunks : [text.slice(0, maxLen)];
 }
 
 export const generateMockExam = async (pdfText) => {

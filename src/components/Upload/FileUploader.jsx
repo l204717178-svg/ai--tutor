@@ -3,7 +3,8 @@ import { useDropzone } from 'react-dropzone'
 import { Upload, FileText, X, CheckCircle2, Loader2, FilePlus, History } from 'lucide-react'
 import { cn } from "../../lib/utils"
 import useFileStore, { useModuleFiles, useHistoryFiles } from "@/store/useFileStore"
-import { extractTextFromPDF } from "@/lib/pdf-utils"
+import { extractLineTextFromPDF, extractTextFromPDF } from "@/lib/pdf-utils"
+import { saveFileToCache } from "@/lib/file-cache"
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 
@@ -38,13 +39,19 @@ export function FileUploader({ mode }) {
                 url: url
             }
 
+            saveFileToCache(newFile).catch((err) => {
+                console.error('Failed to cache file:', err)
+            })
+
             addFileToPool(newFile)
             addFileToModule(mode, newFile.id)
 
             if (file.type === 'application/pdf') {
                 setProcessing(prev => ({ ...prev, [newFile.id]: 'extracting' }))
                 try {
-                    const text = await extractTextFromPDF(url)
+                    const text = mode === 'assignment'
+                        ? await extractLineTextFromPDF(url)
+                        : await extractTextFromPDF(url)
                     appendPdfTextForModule(mode, text)
                     setProcessing(prev => ({ ...prev, [newFile.id]: 'done' }))
                 } catch (err) {
@@ -68,7 +75,8 @@ export function FileUploader({ mode }) {
         addFileToModule(mode, file.id)
         if (file.url && file.type === 'application/pdf') {
             setProcessing(prev => ({ ...prev, [file.id]: 'extracting' }))
-            extractTextFromPDF(file.url).then(text => {
+            const extractor = mode === 'assignment' ? extractLineTextFromPDF : extractTextFromPDF
+            extractor(file.url).then(text => {
                 appendPdfTextForModule(mode, text)
                 setProcessing(prev => ({ ...prev, [file.id]: 'done' }))
             }).catch(() => {

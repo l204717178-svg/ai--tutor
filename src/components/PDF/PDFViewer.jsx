@@ -1,19 +1,26 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Document, Page, pdfjs } from 'react-pdf';
-import { ScrollArea } from "@/components/ui/scroll-area"
+import 'react-pdf/dist/Page/TextLayer.css';
+import { ScrollArea, ScrollBar } from "@/components/ui/scroll-area"
 import { Loader2, AlertCircle, FileUp } from 'lucide-react'
+import { TextSelectionToolbar } from './TextSelectionToolbar';
+import useFileStore from "@/store/useFileStore"
 
 pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
 
-export function PDFViewer({ file }) {
+export function PDFViewer({ file, viewportRef, onViewportScroll, onVisiblePage, renderPagePair }) {
+    const zoomLevel = useFileStore((s) => s.study?.zoomLevel || 1)
     const [numPages, setNumPages] = useState(null)
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState(null)
     const [containerWidth, setContainerWidth] = useState(600) // Default fallback
+    const [observerRoot, setObserverRoot] = useState(null)
     const containerRef = useRef(null)
+    const wrapperRef = useRef(null)
+    const pageRefs = useRef({})
 
     useEffect(() => {
-        const currentContainer = containerRef.current;
+        const currentContainer = wrapperRef.current;
         if (!currentContainer) return;
 
         // Use ResizeObserver to update width on container resize
@@ -49,6 +56,44 @@ export function PDFViewer({ file }) {
         setError(err);
     }
 
+    useEffect(() => {
+        if (!viewportRef) return
+        let rafId = null
+        const tick = () => {
+            if (viewportRef.current) {
+                setObserverRoot(viewportRef.current)
+                return
+            }
+            rafId = window.requestAnimationFrame(tick)
+        }
+        tick()
+        return () => {
+            if (rafId) window.cancelAnimationFrame(rafId)
+        }
+    }, [viewportRef])
+
+    useEffect(() => {
+        if (!onVisiblePage) return
+        if (!numPages) return
+        if (!observerRoot) return
+        const observer = new IntersectionObserver(
+            (entries) => {
+                entries.forEach((entry) => {
+                    if (!entry.isIntersecting) return
+                    const page = Number(entry.target.dataset.page || 0)
+                    if (page) onVisiblePage(page)
+                })
+            },
+            { root: observerRoot, threshold: 0.2 }
+        )
+
+        Object.values(pageRefs.current).forEach((el) => {
+            if (el) observer.observe(el)
+        })
+
+        return () => observer.disconnect()
+    }, [numPages, onVisiblePage, observerRoot])
+
     if (!file) {
         return (
             <div className="h-full flex items-center justify-center text-muted-foreground p-4 text-center">
@@ -63,11 +108,13 @@ export function PDFViewer({ file }) {
 
     // Calculate optimal width for the page (leaving room for scrollbar and padding)
     const optimalPageWidth = Math.max(containerWidth - 16, 200); // 16px = 8px padding * 2
+    const effectWidth = renderPagePair ? Math.min(containerWidth, 1200) : containerWidth;
+    const pairPageWidth = Math.max((effectWidth - 72) / 2, 200); // Adjust for grid-cols-2, gap-6 (24px), px-6 (48px)
 
     return (
-        <div className="h-full flex flex-col bg-gray-100 dark:bg-gray-900 overflow-hidden relative">
-            <ScrollArea className="h-full w-full">
-                <div ref={containerRef} className="flex flex-col items-center min-h-full py-2 px-2 max-w-full">
+        <div ref={wrapperRef} className="h-full flex flex-col bg-gray-100 dark:bg-gray-900 overflow-hidden relative">
+            <ScrollArea className="h-full w-full" viewportRef={viewportRef} onViewportScroll={onViewportScroll}>
+                <div ref={containerRef} className="flex flex-col min-h-full py-2 px-2 min-w-full w-max">
                     <Document
                         file={file.url}
                         onLoadSuccess={onDocumentLoadSuccess}
@@ -90,21 +137,65 @@ export function PDFViewer({ file }) {
                                 </div>
                             </div>
                         }
-                        className="shadow-lg max-w-full"
+                        className="shadow-lg min-w-full flex-col flex"
                     >
-                        {numPages && Array.from(new Array(numPages), (el, index) => (
-                            <Page
-                                key={`page_${index + 1}`}
-                                pageNumber={index + 1}
-                                renderTextLayer={false}
-                                renderAnnotationLayer={false}
-                                className="mb-4 shadow-md bg-white rounded-sm overflow-hidden"
-                                width={optimalPageWidth}
-                                error={<div className="p-4 text-red-500">Page Error</div>}
-                            />
-                        ))}
+                        {numPages && Array.from(new Array(numPages), (el, index) => {
+                            const pageNumber = index + 1
+                            if (renderPagePair) {
+                                return renderPagePair({
+                                    pageNumber,
+                                    pageRef: (el) => {
+                                        if (el) {
+                                            pageRefs.current[pageNumber] = el
+                                        } else {
+                                            delete pageRefs.current[pageNumber]
+                                        }
+                                    },
+                                    PageNode: (
+                                        <Page
+                                            key={`page_${pageNumber}`}
+                                            pageNumber={pageNumber}
+                                            renderTextLayer={true}
+                                            renderAnnotationLayer={false}
+                                            className="shadow-md bg-white rounded-sm overflow-hidden"
+                                            width={pairPageWidth}
+                                            scale={zoomLevel}
+                                            error={<div className="p-4 text-red-500">Page Error</div>}
+                                        />
+                                    )
+                                })
+                            }
+
+                            return (
+                                <div
+                                    key={`page_wrap_${pageNumber}`}
+                                    data-page={pageNumber}
+                                    className="mb-4"
+                                    ref={(el) => {
+                                        if (el) {
+                                            pageRefs.current[pageNumber] = el
+                                        } else {
+                                            delete pageRefs.current[pageNumber]
+                                        }
+                                    }}
+                                >
+                                    <Page
+                                        key={`page_${pageNumber}`}
+                                        pageNumber={pageNumber}
+                                        renderTextLayer={true}
+                                        renderAnnotationLayer={false}
+                                        className="shadow-md bg-white rounded-sm overflow-hidden"
+                                        width={optimalPageWidth}
+                                        scale={zoomLevel}
+                                        error={<div className="p-4 text-red-500">Page Error</div>}
+                                    />
+                                </div>
+                            )
+                        })}
                     </Document>
                 </div>
+                <TextSelectionToolbar containerRef={containerRef} />
+                <ScrollBar orientation="horizontal" />
             </ScrollArea>
         </div>
     );

@@ -7,7 +7,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
-import useFileStore, { useActiveFile, useModulePdfText } from "@/store/useFileStore"
+import useFileStore, { useActiveFile, useModulePdfText, useModuleChatHistory } from "@/store/useFileStore"
 import { chatWithMentor } from "@/lib/ai-service"
 import { cn } from "../../lib/utils"
 
@@ -19,41 +19,69 @@ const MODE_LABELS = {
 
 export function ChatInterface() {
     const currentMode = useFileStore((s) => s.currentMode)
-    const chatHistory = useFileStore((s) => s.chatHistory)
-    const addChatMessage = useFileStore((s) => s.addChatMessage)
+    const chatHistory = useModuleChatHistory(currentMode)
+    const addChatMessageToModule = useFileStore((s) => s.addChatMessageToModule)
 
     const activeFile = useActiveFile(currentMode)
     const pdfTextContent = useModulePdfText(currentMode)
 
-    const [input, setInput] = useState('')
+    const chatInputValue = useFileStore((s) => s.chatInputValue)
+    const setChatInputValue = useFileStore((s) => s.setChatInputValue)
+    const directAIRequestTrigger = useFileStore((s) => s.directAIRequestTrigger)
+
     const [loading, setLoading] = useState(false)
     const scrollRef = useRef(null)
+    const textareaRef = useRef(null)
 
     useEffect(() => {
         if (scrollRef.current) {
-            scrollRef.current.scrollIntoView({ behavior: 'smooth' })
+            scrollRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' })
         }
-    }, [chatHistory])
+    }, [chatHistory, loading])
 
-    const handleSend = async () => {
-        if (!input.trim() || loading) return
+    const handleSend = async (overrideInput = null) => {
+        const messageText = overrideInput || chatInputValue
+        if (!messageText.trim() || loading) return
 
-        const userMsg = { role: 'user', content: input }
-        addChatMessage(userMsg)
-        setInput('')
+        const userMsg = { role: 'user', content: messageText }
+        const nextHistory = [...chatHistory, userMsg]
+        addChatMessageToModule(currentMode, userMsg)
+
+        if (!overrideInput) {
+            setChatInputValue('') // Only clear if it was a manual send from the input box
+        }
+
         setLoading(true)
 
         try {
             const context = pdfTextContent || "No document loaded."
-            const text = await chatWithMentor(input, chatHistory, context)
-            addChatMessage({ role: 'assistant', content: text })
+            const text = await chatWithMentor(messageText, nextHistory, context)
+            addChatMessageToModule(currentMode, { role: 'assistant', content: text })
         } catch (e) {
             console.error(e)
-            addChatMessage({ role: 'assistant', content: `Error: ${e.message}` })
+            addChatMessageToModule(currentMode, { role: 'assistant', content: `Error: ${e.message}` })
         } finally {
             setLoading(false)
         }
     }
+
+    // Direct AI Request listener (e.g. from Text Selection "Explain")
+    useEffect(() => {
+        if (directAIRequestTrigger > 0 && chatInputValue) {
+            handleSend(chatInputValue)
+            setChatInputValue('');
+        }
+    }, [directAIRequestTrigger])
+
+    // Focus listener (e.g. from Text Selection "Ask AI")
+    useEffect(() => {
+        if (chatInputValue.startsWith('> ') && textareaRef.current) {
+            textareaRef.current.focus();
+            // Move cursor to the end
+            const length = textareaRef.current.value.length;
+            textareaRef.current.setSelectionRange(length, length);
+        }
+    }, [chatInputValue])
 
     const handleKeyDown = (e) => {
         if (e.key === 'Enter' && !e.shiftKey) {
@@ -158,8 +186,9 @@ export function ChatInterface() {
             <div className="p-4 bg-background border-t">
                 <div className="relative max-w-2xl mx-auto group">
                     <Textarea
-                        value={input}
-                        onChange={(e) => setInput(e.target.value)}
+                        ref={textareaRef}
+                        value={chatInputValue}
+                        onChange={(e) => setChatInputValue(e.target.value)}
                         onKeyDown={handleKeyDown}
                         placeholder="Type your question..."
                         className="min-h-[60px] max-h-[200px] w-full pr-12 pl-4 py-4 resize-none rounded-2xl border-slate-200 focus-visible:ring-blue-500/20 focus-visible:border-blue-500 transition-all shadow-sm bg-white"
@@ -169,10 +198,10 @@ export function ChatInterface() {
                         variant="ghost"
                         className={cn(
                             "absolute bottom-3 right-3 h-8 w-8 rounded-full transition-all",
-                            input.trim() ? "bg-blue-600 text-white hover:bg-blue-700" : "text-slate-300 pointer-events-none"
+                            chatInputValue.trim() ? "bg-blue-600 text-white hover:bg-blue-700" : "text-slate-300 pointer-events-none"
                         )}
-                        disabled={loading || !input.trim()}
-                        onClick={handleSend}
+                        disabled={loading || !chatInputValue.trim()}
+                        onClick={() => handleSend()}
                     >
                         {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
                     </Button>
